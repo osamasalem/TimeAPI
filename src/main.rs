@@ -15,95 +15,127 @@ use std::{env, str::FromStr};
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 
+const DEFAULT_LOG_LEVEL: &str = "INFO";
+const DEFAULT_IP_ADDRESS: &str = "127.0.0.1";
+const DEFAULT_PORT: u16 = 3000;
+const DEFAULT_NTP_SERVER: &str = "time.google.com:123";
+
 struct TimeCache {
     last_ntp: DateTime<Utc>,
     last_updated: SystemTime,
 }
 
 struct AppContext {
+    ntp_server: String,
+    cache_timeout: u64,
     time_cache: RwLock<Option<TimeCache>>,
 }
 
-const CACHE_DURATION: u64 = 5 * 60;
+const DEFAULT_CACHE_DURATION: u64 = 5 * 60;
 
 impl AppContext {
-    async fn get_time(&self) -> Result<DateTime<Utc>, Cow<'static, str>> {
-        if let Some(val) = self.get_time_internal().await {
-            Ok(val)
-        } else {
-            self.update_and_return_new_time().await
+    pub fn new(time_out: u64, ntp_server: String) -> Self {
+        Self {
+            ntp_server,
+            cache_timeout: time_out,
+            time_cache: RwLock::new(None),
         }
+    }
+
+    pub async fn get_time(&self) -> DateTime<Utc> {
+        self.get_time_internal()
+            .await
+            .unwrap_or(self.update_and_return_new_time().await)
     }
 
     async fn get_time_internal(&self) -> Option<DateTime<Utc>> {
         let lock = self.time_cache.read().await;
 
         if let Some(time) = lock.deref() {
-            if let Ok(duration @ ..CACHE_DURATION) = SystemTime::now()
+            let duration: Result<i128, _> = SystemTime::now()
                 .duration_since(time.last_updated)
-                .map(|x| x.as_secs())
+                .map(|x| x.as_secs().into());
+            if duration
+                .as_ref()
+                .is_ok_and(|dur| (..self.cache_timeout.into()).contains(dur))
             {
                 return time
                     .last_ntp
-                    .checked_add_signed(TimeDelta::seconds(duration.try_into().ok()?));
+                    .checked_add_signed(TimeDelta::seconds(duration.unwrap() as i64));
             }
         }
 
         None
     }
 
-    async fn update_and_return_new_time(&self) -> Result<DateTime<Utc>, Cow<'static, str>> {
+    fn request_ntp_async<A>(addr: A) -> JoinHandle<ntp::errors::Result<ntp::packet::Packet>>
+    where
+        A: ToSocketAddrs + Send + 'static,
+    {
+        tokio::spawn(async move { ntp::request(addr) })
+    }
+
+    async fn get_time_from_ntp(&self) -> Result<DateTime<Utc>, Cow<'static, str>> {
+        let address = self.ntp_server.clone();
+        let response = Self::request_ntp_async(address)
+            .await
+            .map_err(|err| format!("failed to join async taks :{err}"))?
+            .map_err(|err| format!("connection to ntp failed : {err}"))?;
+
+        let ntp_time = response.ref_time;
+
+        info!("from ntp : {sec}", sec = ntp_time.sec);
+
+        let time = chrono::Utc
+            .timestamp_opt(ntp_time.sec as i64, 0)
+            .single()
+            .ok_or(format!("Error to get single time from {}", ntp_time.sec))?
+            .checked_sub_months(Months::new(70 * 12))
+            .ok_or(format!("Error to adjust time from {}", ntp_time.sec))?;
+        Ok(time)
+    }
+
+    async fn update_and_return_new_time(&self) -> DateTime<Utc> {
         info!("Update from ntp server");
 
         let mut lock = self.time_cache.write().await;
 
-        if let Some(ref mut time) = *lock {
-            if let Ok(CACHE_DURATION..) = SystemTime::now()
+        if let Some(ref mut time) = lock.deref_mut() {
+            let duration: Result<i128, _> = SystemTime::now()
                 .duration_since(time.last_updated)
-                .map(|x| x.as_secs())
+                .map(|x| x.as_secs().into());
+
+            if duration
+                .as_ref()
+                .is_ok_and(|dur| (self.cache_timeout.into()..).contains(dur))
             {
-                time.last_ntp = get_time_from_ntp().await?;
-                time.last_updated = SystemTime::now();
+                if let Ok(val) = self.get_time_from_ntp().await {
+                    time.last_ntp = val;
+                    time.last_updated = SystemTime::now();
+                } else {
+                    return time
+                        .last_ntp
+                        .checked_add_signed(TimeDelta::seconds(duration.unwrap() as i64))
+                        .unwrap_or(chrono::Utc::now());
+                }
             }
 
-            Ok(time.last_ntp)
+            time.last_ntp
         } else {
-            let time = get_time_from_ntp().await?;
+            let time = lock.deref_mut();
 
-            let rererence = lock.deref_mut();
-            *rererence = Some(TimeCache {
-                last_ntp: time,
-                last_updated: SystemTime::now(),
-            });
-            Ok(time)
+            self.get_time_from_ntp()
+                .await
+                .inspect(|val| {
+                    *time = Some(TimeCache {
+                        last_ntp: *val,
+                        last_updated: SystemTime::now(),
+                    });
+                })
+                .inspect_err(|_| error!("Error Get time from NTP"))
+                .unwrap_or(chrono::Utc::now())
         }
     }
-}
-fn request_ntp_async<A>(addr: A) -> JoinHandle<ntp::errors::Result<ntp::packet::Packet>>
-where
-    A: ToSocketAddrs + Send + 'static,
-{
-    tokio::spawn(async move { ntp::request(addr) })
-}
-
-async fn get_time_from_ntp() -> Result<DateTime<Utc>, Cow<'static, str>> {
-    let address = "time.google.com:123";
-    let response = request_ntp_async(address)
-        .await
-        .map_err(|err| format!("failed to join async taks :{err}"))?
-        .map_err(|err| format!("connection to ntp failed : {err}"))?;
-
-    let ntp_time = response.ref_time;
-
-    info!("from ntp : {sec}", sec = ntp_time.sec);
-
-    let time = chrono::Utc
-        .timestamp_opt(ntp_time.sec as i64, 0)
-        .single()
-        .ok_or(format!("Error to get single time from {}", ntp_time.sec))?
-        .checked_sub_months(Months::new(70 * 12))
-        .ok_or(format!("Error to adjust time from {}", ntp_time.sec))?;
-    Ok(time)
 }
 
 #[get("/health")]
@@ -113,11 +145,7 @@ async fn health() -> impl Responder {
 
 #[get("/now")]
 async fn now(app: web::Data<AppContext>) -> Result<impl Responder> {
-    let time = app
-        .get_time()
-        .await
-        .inspect_err(|err| error!("Cannot get time from NTP : {err}"))
-        .map_err(|_| error::ErrorInternalServerError("Cannot get time from NTP"))?;
+    let time = app.get_time().await;
     info!("/now: {:?}", time);
     Ok(web::Json(models::Time::from(time)))
 }
@@ -135,11 +163,7 @@ async fn now_with_tz(
     .parse()
     .map_err(|_| error::ErrorBadRequest("Invalid Time zone"))?;
 
-    let time = app
-        .get_time()
-        .await
-        .inspect_err(|err| error!("Cannot get time from NTP : {err}"))
-        .map_err(|_| error::ErrorInternalServerError("Cannot get time from NTP"))?;
+    let time = app.get_time().await;
 
     let time = timezone.from_utc_datetime(&time.naive_utc());
     info!("now with tz: {:?}", time);
@@ -150,11 +174,17 @@ async fn now_with_tz(
 async fn main() -> std::io::Result<()> {
     let _ = dotenv();
 
-    let loglevel = env::var("TIMEAPI_LOG_LEVEL").unwrap_or("INFO".to_owned());
-    let address = env::var("TIMEAPI_ADDRESS").unwrap_or("127.0.0.1".to_owned());
-    let port = env::var("TIMEAPI_PORT")
-        .map(|var| var.parse::<u16>().unwrap_or(3000))
-        .unwrap_or(3000);
+    let loglevel = env::var("LOG_LEVEL").unwrap_or(DEFAULT_LOG_LEVEL.to_owned());
+    let address = env::var("IP").unwrap_or(DEFAULT_IP_ADDRESS.to_owned());
+    let port = env::var("PORT")
+        .map(|var| var.parse::<u16>().unwrap_or(DEFAULT_PORT))
+        .unwrap_or(DEFAULT_PORT);
+
+    let ntp_server = env::var("NTP_SERVER").unwrap_or(DEFAULT_NTP_SERVER.to_owned());
+
+    let cache_timeout = env::var("CACHE_TIMEOUT")
+        .map(|var| var.parse::<u64>().unwrap_or(DEFAULT_CACHE_DURATION))
+        .unwrap_or(DEFAULT_CACHE_DURATION);
 
     let _ = TermLogger::init(
         LevelFilter::from_str(&loglevel).unwrap_or(LevelFilter::Info),
@@ -163,9 +193,7 @@ async fn main() -> std::io::Result<()> {
         ColorChoice::Auto,
     );
 
-    let app_state = web::Data::new(AppContext {
-        time_cache: RwLock::new(None),
-    });
+    let app_state = web::Data::new(AppContext::new(cache_timeout, ntp_server));
 
     info!("Listening on {address}:{port}");
     HttpServer::new(move || {
