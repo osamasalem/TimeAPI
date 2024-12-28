@@ -1,24 +1,25 @@
 mod models;
 mod utils;
 
+use actix_cors::Cors;
 use actix_web::{error, get, web, App, HttpResponse, HttpServer, Responder, Result};
 use chrono::{DateTime, Months, TimeDelta, TimeZone, Utc};
 use chrono_tz::Tz;
 use dotenv::dotenv;
-use log::{error, info, LevelFilter};
+use log::{error, info, trace, LevelFilter};
 use simplelog::{ColorChoice, Config, TermLogger, TerminalMode};
 use std::borrow::Cow;
-use std::net::ToSocketAddrs;
+use std::fmt::Debug;
 use std::ops::{Deref, DerefMut};
 use std::time::SystemTime;
 use std::{env, str::FromStr};
 use tokio::sync::RwLock;
-use tokio::task::JoinHandle;
 
-const DEFAULT_LOG_LEVEL: &str = "INFO";
 const DEFAULT_IP_ADDRESS: &str = "127.0.0.1";
-const DEFAULT_PORT: u16 = 3000;
 const DEFAULT_NTP_SERVER: &str = "time.google.com:123";
+const DEFAULT_PORT: u16 = 3000;
+const DEFAULT_CACHE_DURATION: u64 = 5 * 60; // sec
+const DEFAULT_CORS_ORIGIN: &str = "127.0.0.1";
 
 struct TimeCache {
     last_ntp: DateTime<Utc>,
@@ -31,10 +32,9 @@ struct AppContext {
     time_cache: RwLock<Option<TimeCache>>,
 }
 
-const DEFAULT_CACHE_DURATION: u64 = 5 * 60;
-
 impl AppContext {
     pub fn new(time_out: u64, ntp_server: String) -> Self {
+          
         Self {
             ntp_server,
             cache_timeout: time_out,
@@ -43,12 +43,15 @@ impl AppContext {
     }
 
     pub async fn get_time(&self) -> DateTime<Utc> {
-        self.get_time_internal()
-            .await
-            .unwrap_or(self.update_and_return_new_time().await)
+        match self.fast_get_time_from_cache().await {
+            Some(val) => val,
+            _ => self.update_and_return_new_time().await,
+        }
     }
 
-    async fn get_time_internal(&self) -> Option<DateTime<Utc>> {
+    async fn fast_get_time_from_cache(&self) -> Option<DateTime<Utc>> {
+        trace!("Read time from cache");
+
         let lock = self.time_cache.read().await;
 
         if let Some(time) = lock.deref() {
@@ -59,28 +62,24 @@ impl AppContext {
                 .as_ref()
                 .is_ok_and(|dur| (..self.cache_timeout.into()).contains(dur))
             {
-                return time
+                trace!("cache is not expired {duration:?}");
+
+                let ret = time
                     .last_ntp
                     .checked_add_signed(TimeDelta::seconds(duration.unwrap() as i64));
+
+                trace!("cache is not expired #2 {ret:?}");
+                return ret;
             }
         }
 
         None
     }
 
-    fn request_ntp_async<A>(addr: A) -> JoinHandle<ntp::errors::Result<ntp::packet::Packet>>
-    where
-        A: ToSocketAddrs + Send + 'static,
-    {
-        tokio::spawn(async move { ntp::request(addr) })
-    }
-
     async fn get_time_from_ntp(&self) -> Result<DateTime<Utc>, Cow<'static, str>> {
         let address = self.ntp_server.clone();
-        let response = Self::request_ntp_async(address)
-            .await
-            .map_err(|err| format!("failed to join async taks :{err}"))?
-            .map_err(|err| format!("connection to ntp failed : {err}"))?;
+        let response =
+            ntp::request(address).map_err(|err| format!("connection to ntp failed : {err}"))?;
 
         let ntp_time = response.ref_time;
 
@@ -101,6 +100,7 @@ impl AppContext {
         let mut lock = self.time_cache.write().await;
 
         if let Some(ref mut time) = lock.deref_mut() {
+            trace!("Use the cache");
             let duration: Result<i128, _> = SystemTime::now()
                 .duration_since(time.last_updated)
                 .map(|x| x.as_secs().into());
@@ -109,10 +109,14 @@ impl AppContext {
                 .as_ref()
                 .is_ok_and(|dur| (self.cache_timeout.into()..).contains(dur))
             {
+                trace!("cache is time out");
                 if let Ok(val) = self.get_time_from_ntp().await {
+                    trace!("Update the cache");
+
                     time.last_ntp = val;
                     time.last_updated = SystemTime::now();
                 } else {
+                    trace!("Fallback to the value we have");
                     return time
                         .last_ntp
                         .checked_add_signed(TimeDelta::seconds(duration.unwrap() as i64))
@@ -122,6 +126,7 @@ impl AppContext {
 
             time.last_ntp
         } else {
+            trace!("Instentiate the new cache");
             let time = lock.deref_mut();
 
             self.get_time_from_ntp()
@@ -172,22 +177,34 @@ async fn now_with_tz(
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
+    #[inline]
+    fn parse_env<T>(name: &str, default: T) -> T
+    where
+        T: FromStr + Debug,
+    {
+        env::var(name)
+            .ok()
+            .and_then(|val| {
+                println!("Get the {name} value from env:{val:?}");
+                val.parse::<T>().ok()
+            })
+            .unwrap_or_else(|| {
+                println!("Get the default value fro {name} :{default:?}");
+                default
+            })
+    }
+
     let _ = dotenv();
 
-    let loglevel = env::var("LOG_LEVEL").unwrap_or(DEFAULT_LOG_LEVEL.to_owned());
-    let address = env::var("IP").unwrap_or(DEFAULT_IP_ADDRESS.to_owned());
-    let port = env::var("PORT")
-        .map(|var| var.parse::<u16>().unwrap_or(DEFAULT_PORT))
-        .unwrap_or(DEFAULT_PORT);
-
-    let ntp_server = env::var("NTP_SERVER").unwrap_or(DEFAULT_NTP_SERVER.to_owned());
-
-    let cache_timeout = env::var("CACHE_TIMEOUT")
-        .map(|var| var.parse::<u64>().unwrap_or(DEFAULT_CACHE_DURATION))
-        .unwrap_or(DEFAULT_CACHE_DURATION);
+    let loglevel = parse_env("LOG_LEVEL", LevelFilter::Info);
+    let address = parse_env("IP", DEFAULT_IP_ADDRESS.to_owned());
+    let port = parse_env("PORT", DEFAULT_PORT);
+    let ntp_server = parse_env("NTP_SERVER", DEFAULT_NTP_SERVER.to_owned());
+    let cache_timeout = parse_env("CACHE_TIMEOUT", DEFAULT_CACHE_DURATION);
+    let cors_origin = parse_env("CORS_ORIGIN", DEFAULT_CORS_ORIGIN.to_owned());
 
     let _ = TermLogger::init(
-        LevelFilter::from_str(&loglevel).unwrap_or(LevelFilter::Info),
+        loglevel,
         Config::default(),
         TerminalMode::Mixed,
         ColorChoice::Auto,
@@ -196,9 +213,16 @@ async fn main() -> std::io::Result<()> {
     let app_state = web::Data::new(AppContext::new(cache_timeout, ntp_server));
 
     info!("Listening on {address}:{port}");
+
     HttpServer::new(move || {
+        let cors = Cors::default()
+            .allowed_origin(cors_origin.clone().as_str())
+            .allowed_methods(vec!["GET"])
+            .max_age(3600);
+
         App::new()
             .app_data(app_state.clone())
+            .wrap(cors)
             .service(now)
             .service(health)
             .service(now_with_tz)
