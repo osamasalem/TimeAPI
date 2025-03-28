@@ -29,10 +29,9 @@ impl AppContext {
     }
 
     pub async fn get_time(&self) -> DateTime<Utc> {
-        match self.fast_get_time_from_cache().await {
-            Some(val) => val,
-            _ => self.update_and_return_new_time().await,
-        }
+        self.fast_get_time_from_cache()
+            .await
+            .unwrap_or_else(|| async { self.update_and_return_new_time().await });
     }
 
     async fn fast_get_time_from_cache(&self) -> Option<DateTime<Utc>> {
